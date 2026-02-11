@@ -178,7 +178,7 @@ if(BUILD_WITH_VIEWER)
   target_link_libraries(map_editor
     glim
   )
-  
+
   # Memory monitor
   add_library(memory_monitor SHARED
     src/glim/viewer/memory_monitor.cpp
@@ -188,6 +188,46 @@ if(BUILD_WITH_VIEWER)
   )
 
   list(APPEND glim_LIBRARIES standard_viewer interactive_viewer memory_monitor map_editor)
+endif()
+
+# PCD Mapper executable
+find_package(PCL QUIET)
+if(PCL_FOUND)
+  add_executable(pcd_mapper
+    pcd_mapper/src/pcd_mapper.cpp
+  )
+  # Set output directory to avoid conflict with source directory name
+  set_target_properties(pcd_mapper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  target_include_directories(pcd_mapper PRIVATE
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_directories(pcd_mapper PRIVATE
+    ${PCL_LIBRARY_DIRS}
+  )
+  target_link_libraries(pcd_mapper
+    glim
+    ${PCL_LIBRARIES}
+    Eigen3::Eigen
+  )
+  target_compile_definitions(pcd_mapper PRIVATE
+    ${PCL_DEFINITIONS}
+  )
+
+  # Copy config directory to build directory for pcd_mapper
+  file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/pcd_mapper/config
+       DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/pcd_mapper)
+
+  # Install pcd_mapper executable
+  install(TARGETS pcd_mapper
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+
+  # Install pcd_mapper config directory
+  install(DIRECTORY pcd_mapper/config
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/pcd_mapper
+  )
 endif()
 
 #############

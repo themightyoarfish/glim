@@ -421,9 +421,10 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_between_facto
 
   const gtsam::Pose3 estimated_delta = values.at<gtsam::Pose3>(X(1));
   const auto linearized = factor->linearize(values);
-  const auto H = linearized->hessianBlockDiagonal()[X(1)] + 1e6 * gtsam::Matrix6::Identity();
+  const gtsam::Matrix6 H = linearized->hessianBlockDiagonal()[X(1)] + 1e6 * gtsam::Matrix6::Identity();
 
-  factors->add(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), estimated_delta, gtsam::noiseModel::Gaussian::Information(H)));
+  auto f = gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), estimated_delta, gtsam::noiseModel::Gaussian::Information(H));
+  factors->add(f);
   return factors;
 }
 
@@ -633,7 +634,6 @@ void GlobalMapping::save(const std::string& path) {
   logger->info("saving config");
   GlobalConfig::instance()->dump(path + "/config");
 }
-
 
 gtsam_points::PointCloud::Ptr GlobalMapping::export_points() {
   auto merged = std::make_shared<gtsam_points::PointCloudCPU>();
