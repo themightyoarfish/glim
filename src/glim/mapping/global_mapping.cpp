@@ -377,7 +377,7 @@ void GlobalMapping::optimize() {
 }
 
 std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_between_factors(int current) const {
-  auto factors = gtsam::make_shared<gtsam::NonlinearFactorGraph>();
+  auto factors = std::make_shared<gtsam::NonlinearFactorGraph>();
   if (current == 0 || !params.enable_between_factors) {
     return factors;
   }
@@ -421,14 +421,14 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_between_facto
 
   const gtsam::Pose3 estimated_delta = values.at<gtsam::Pose3>(X(1));
   const auto linearized = factor->linearize(values);
-  const auto H = linearized->hessianBlockDiagonal()[X(1)] + 1e6 * gtsam::Matrix6::Identity();
+  const gtsam::Matrix6 H = linearized->hessianBlockDiagonal()[X(1)] + 1e6 * gtsam::Matrix6::Identity();
 
   factors->add(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), estimated_delta, gtsam::noiseModel::Gaussian::Information(H)));
   return factors;
 }
 
 std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_cost_factors(int current) const {
-  auto factors = gtsam::make_shared<gtsam::NonlinearFactorGraph>();
+  auto factors = std::make_shared<gtsam::NonlinearFactorGraph>();
   if (current == 0) {
     return factors;
   }
@@ -503,7 +503,7 @@ gtsam_points::ISAM2ResultExt GlobalMapping::update_isam2(const gtsam::NonlinearF
     });
 #endif
   } catch (const gtsam::IndeterminantLinearSystemException& e) {
-    logger->error("an indeterminant lienar system exception was caught during global map optimization!!");
+    logger->error("an indeterminant linear system exception was caught during global map optimization!!");
     logger->error(e.what());
     indeterminant_nearby_key = e.nearbyVariable();
   } catch (const std::exception& e) {

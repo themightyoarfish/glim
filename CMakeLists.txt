@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(glim VERSION 1.1.0 LANGUAGES CXX)
+project(glim VERSION 1.2.1 LANGUAGES CXX)
 
 add_compile_options(-std=c++17)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -24,7 +24,7 @@ endif()
 
 find_package(Boost REQUIRED serialization)
 find_package(Eigen3 REQUIRED)
-find_package(GTSAM 4.3 REQUIRED)
+find_package(GTSAM 4.2 REQUIRED)
 find_package(gtsam_points 1.2.0 REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(spdlog REQUIRED)
@@ -71,6 +71,7 @@ add_library(glim SHARED
   src/glim/preprocess/cloud_preprocessor.cpp
   # common process
   src/glim/common/imu_integration.cpp
+  src/glim/common/imu_validation.cpp
   src/glim/common/cloud_deskewing.cpp
   src/glim/common/cloud_covariance_estimation.cpp
   # odometry
@@ -152,6 +153,8 @@ if(BUILD_WITH_VIEWER)
   # Standard viewer
   add_library(standard_viewer SHARED
     src/glim/viewer/standard_viewer.cpp
+    src/glim/viewer/standard_viewer_ui.cpp
+    src/glim/viewer/standard_viewer_callbacks.cpp
     src/glim/viewer/standard_viewer_mem.cpp
   )
   target_link_libraries(standard_viewer
@@ -178,7 +181,7 @@ if(BUILD_WITH_VIEWER)
   target_link_libraries(map_editor
     glim
   )
-  
+
   # Memory monitor
   add_library(memory_monitor SHARED
     src/glim/viewer/memory_monitor.cpp

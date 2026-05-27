@@ -6,6 +6,7 @@
 
 #include <gtsam/navigation/ImuFactor.h>
 #include <glim/odometry/odometry_estimation_base.hpp>
+#include <gtsam_points/util/gtsam_migration.hpp>
 #include <gtsam_points/util/indexed_sliding_window.hpp>
 
 namespace gtsam {
@@ -22,6 +23,7 @@ class IncrementalFixedLagSmootherExtWithFallback;
 namespace glim {
 
 class IMUIntegration;
+class IMUValidation;
 class CloudDeskewing;
 class CloudCovarianceEstimation;
 class InitialStateEstimation;
@@ -57,6 +59,7 @@ public:
   double isam2_relinearize_thresh;
 
   // Logging params
+  bool validate_imu;
   bool save_imu_rate_trajectory;
 
   int num_threads;                  // Number of threads for preprocessing and per-factor parallelism
@@ -79,7 +82,7 @@ public:
 
 protected:
   virtual void create_frame(EstimationFrame::Ptr& frame) {}
-  virtual gtsam::NonlinearFactorGraph create_factors(const int current, const std::shared_ptr<gtsam::ImuFactor>& imu_factor, gtsam::Values& new_values) = 0;
+  virtual gtsam::NonlinearFactorGraph create_factors(const int current, const gtsam_points::shared_ptr<gtsam::ImuFactor>& imu_factor, gtsam::Values& new_values) = 0;
 
   virtual void fallback_smoother() {}
   virtual void update_frames(const int current, const gtsam::NonlinearFactorGraph& new_factors);
@@ -102,6 +105,7 @@ protected:
   // Utility classes
   std::unique_ptr<InitialStateEstimation> init_estimation;
   std::unique_ptr<IMUIntegration> imu_integration;
+  std::unique_ptr<IMUValidation> imu_validation;
   std::unique_ptr<CloudDeskewing> deskewing;
   std::unique_ptr<CloudCovarianceEstimation> covariance_estimation;
 
