@@ -86,22 +86,38 @@ int IMUIntegration::integrate_imu(
   const gtsam::imuBias::ConstantBias& bias,
   std::vector<double>& pred_times,
   std::vector<Eigen::Isometry3d>& pred_poses) {
-  //
+  // Inputs:
+  //   start_time, end_time  - time window [start_time, end_time] to integrate over
+  //   state                 - initial NavState (pose + velocity) at start_time in the same frame as the output poses
+  //   bias                  - constant IMU bias (accel/gyro) applied during preintegration
+  //   imu_queue (member)    - buffered IMU samples, each [stamp, linear_acc, angular_vel]
+  // Outputs (appended to caller-provided vectors):
+  //   pred_times            - timestamps at which poses are predicted (start, each IMU stamp in range, end)
+  //   pred_poses            - IMU poses (T_world_imu) at those timestamps, propagated from state via GTSAM preintegration
+  // Return value:
+  //   cursor into imu_queue pointing at the first sample after the integrated segment (for erase_imu_data)
+
+  // Reset the internal preintegrator and apply the current bias estimate.
   imu_measurements->resetIntegrationAndSetBias(bias);
 
+  // Seed the output trajectory with the known pose at the window start.
   pred_times.emplace_back(start_time);
   pred_poses.emplace_back(Eigen::Isometry3d(state.pose().matrix()));
 
+  // Walk imu_queue from the front; cursor tracks how many queue entries were consumed.
   int cursor = 0;
   auto imu_itr = imu_queue.begin();
   double last_stamp = start_time;
 
+  // No IMU data available: hold the initial pose constant through end_time.
   if (imu_itr == imu_queue.end()) {
     pred_times.emplace_back(end_time);
     pred_poses.emplace_back(Eigen::Isometry3d(state.pose().matrix()));
     return cursor;
   }
 
+  // Integrate each IMU sample whose timestamp falls inside [start_time, end_time].
+  // For each step: dt = stamp - last_stamp, integrate (a, w) over dt, then predict pose from the initial state.
   for (; imu_itr != imu_queue.end(); imu_itr++, cursor++) {
     const auto& imu_frame = *imu_itr;
     const double imu_stamp = imu_frame[0];
@@ -124,6 +140,8 @@ int IMUIntegration::integrate_imu(
     last_stamp = imu_stamp;
   }
 
+  // If end_time is after the last integrated IMU stamp, integrate one more partial interval
+  // up to end_time using the last available (a, w) sample (constant IMU hold).
   const double dt = end_time - last_stamp;
   if (dt > 0.0) {
     Eigen::Matrix<double, 7, 1> last_imu_frame = imu_itr == imu_queue.end() ? *(imu_itr - 1) : *imu_itr;

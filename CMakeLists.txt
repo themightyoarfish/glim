@@ -93,6 +93,8 @@ add_library(glim SHARED
   src/glim/mapping/async_global_mapping.cpp
   src/glim/mapping/sub_mapping.cpp
   src/glim/mapping/sub_mapping_passthrough.cpp
+  src/glim/mapping/dynamic_removal/dynamic_removal_base.cpp
+  src/glim/mapping/dynamic_removal/voxel_hit_ratio_removal.cpp
   src/glim/mapping/global_mapping.cpp
   src/glim/mapping/global_mapping_pose_graph.cpp
   # GPU-related

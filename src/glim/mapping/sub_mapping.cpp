@@ -25,6 +25,7 @@
 #include <glim/common/cloud_deskewing.hpp>
 #include <glim/common/cloud_covariance_estimation.hpp>
 #include <glim/mapping/callbacks.hpp>
+#include <glim/mapping/dynamic_removal/dynamic_removal_base.hpp>
 
 #ifdef GTSAM_USE_TBB
 #include <tbb/task_arena.h>
@@ -32,6 +33,7 @@
 
 namespace glim {
 
+// Symbols for the variables and factors in the factor graph. B = bias, V = velocity, X = pose.
 using gtsam::symbol_shorthand::B;
 using gtsam::symbol_shorthand::V;
 using gtsam::symbol_shorthand::X;
@@ -65,6 +67,8 @@ SubMappingParams::SubMappingParams() {
   submap_voxel_resolution = config.param<double>("sub_mapping", "submap_voxel_resolution", 0.5);
   submap_target_num_points = config.param<int>("sub_mapping", "submap_target_num_points", -1);
 
+  dynamic_removal_method = config.param<std::string>("sub_mapping", "dynamic_removal_method", "NONE");
+
   enable_gpu = false;
   if (registration_error_factor_type.find("GPU") != std::string::npos) {
     enable_gpu = true;
@@ -78,6 +82,9 @@ SubMapping::SubMapping(const SubMappingParams& params) : params(params) {
   imu_integration.reset(new IMUIntegration);
   deskewing.reset(new CloudDeskewing);
   covariance_estimation.reset(new CloudCovarianceEstimation);
+
+  Config config(GlobalConfig::get_config_path("config_sub_mapping"));
+  dynamic_removal = DynamicRemovalBase::create(params.dynamic_removal_method, config);
 
   values.reset(new gtsam::Values);
   graph.reset(new gtsam::NonlinearFactorGraph);
@@ -101,10 +108,45 @@ void SubMapping::insert_imu(const double stamp, const Eigen::Vector3d& linear_ac
   }
 }
 
+/**
+ * @brief Ingest one marginalized odometry frame and extend the active submap window.
+ *
+ * Each call queues the incoming frame and processes the *previous* frame once a consecutive pair
+ * exists (one-frame delay). Processing falls into five stages:
+ *
+ * 1. **IMU trajectory smoothing** (enable_imu): Preintegrate IMU between the two LiDAR stamps,
+ *    build a small pose-only graph anchored at both endpoints, optimize it, and store the result
+ *    on odom_frame->imu_rate_trajectory for later scan deskewing in insert_keyframe().
+ *
+ * 2. **Submap graph growth**: Append the frame to odom_frames, insert pose X(current) into values_,
+ *    and on the first frame fix the gauge with a strong prior on X(0).
+ *
+ * 3. **Inter-frame constraints** (current > 0):
+ *    - create_between_factors + between_registration_type: BetweenFactor on X(last→current) using
+ *      the odometry relative pose; if "GICP", derive edge noise from a linearized GICP factor.
+ *    - enable_imu: Insert V(current)/B(current) with soft priors; add ImuFactor(X,V,B) between
+ *      consecutive frames when enough IMU samples exist, plus a bias random-walk on B(last→current).
+ *
+ * 4. **Keyframe selection and registration** (keyframe_update_strategy, max_keyframe_overlap or
+ *    keyframe_update_interval_*, keyframe_update_min_points): The first frame is always a keyframe.
+ *    Later frames become keyframes when overlap drops (OVERLAP) or motion exceeds thresholds
+ *    (DISPLACEMENT). Each new keyframe triggers insert_keyframe() and adds VGICP / VGICP_GPU
+ *    scan-to-map factors (registration_error_factor_type, keyframe_voxelmap_*) linking all prior
+ *    keyframes to the new scan.
+ *
+ * 5. **Submap emission** (max_num_keyframes): When the keyframe count reaches the limit,
+ *    create_submap() optimizes values_/graph_ (enable_optimization), merges keyframe scans
+ *    (submap_downsample_resolution, dynamic_removal_method, submap_target_num_points), pushes
+ *    the SubMap to submap_queue, and resets odom_frames, keyframes, values_, and graph_.
+ *
+ * Memory: point clouds on the second-newest odom frame are dropped (clone_wo_points) after each step.
+ */
 void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
   logger->trace("insert_frame frame_id={} stamp={}", odom_frame_->id, odom_frame_->stamp);
   Callbacks::on_insert_frame(odom_frame_);
 
+  // Hold one frame back so we always process a *pair* of consecutive odometry frames.
+  // IMU integration and scan deskewing need the time interval [stamp_i, stamp_{i+1}].
   delayed_input_queue.emplace_back(odom_frame_);
   if (delayed_input_queue.size() < 2) {
     return;
@@ -114,9 +156,11 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
   delayed_input_queue.pop_front();
   EstimationFrame::ConstPtr next_frame = delayed_input_queue.front();
 
+  // IMU integration and smoothing. used for deskewing.
   if (params.enable_imu) {
     logger->debug("smoothing trajectory");
-    // Smoothing IMU-based pose estimation
+    // Dense IMU-rate poses for motion compensation (deskewing) within this scan.
+    // This is a small, separate factor graph — not the submap graph below.
     gtsam::NavState nav_world_imu(gtsam::Pose3(odom_frame->T_world_imu.matrix()), odom_frame->v_world_imu);
     gtsam::imuBias::ConstantBias imu_bias(odom_frame->imu_bias);
 
@@ -124,17 +168,21 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     std::vector<Eigen::Isometry3d> imu_poses;
     imu_integration->integrate_imu(odom_frame->stamp, next_frame->stamp, nav_world_imu, imu_bias, imu_stamps, imu_poses);
 
+    // Values = current estimate of every variable (here: one Pose3 per IMU sample).
     gtsam::Values values;
     for (int i = 0; i < imu_stamps.size(); i++) {
       values.insert(X(i), gtsam::Pose3(imu_poses[i].matrix()));
     }
 
+    // Factor graph = constraints between variables. Optimize to reconcile IMU motion with LiDAR endpoints.
     gtsam::NonlinearFactorGraph graph;
+    // PriorFactor: pin a variable to a measured value (anchors start/end to odometry IMU poses).
     graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(0), gtsam::Pose3(odom_frame->T_world_imu.matrix()), gtsam::noiseModel::Isotropic::Sigma(6, 1e-5));
     graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(imu_stamps.size() - 1), gtsam::Pose3(next_frame->T_world_imu.matrix()), gtsam::noiseModel::Isotropic::Sigma(6, 1e-5));
     for (int i = 1; i < imu_stamps.size(); i++) {
       const double dt = (imu_stamps[i] - imu_stamps[i - 1]) / (next_frame->stamp - odom_frame->stamp);
       const Eigen::Isometry3d T_last_current = imu_poses[i - 1].inverse() * imu_poses[i];
+      // BetweenFactor: relative pose measurement linking two variables (IMU propagation between samples).
       graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(i - 1), X(i), gtsam::Pose3(T_last_current.matrix()), gtsam::noiseModel::Isotropic::Sigma(6, dt + 1e-2));
     }
 
@@ -152,6 +200,7 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     });
 #endif
 
+    // Store smoothed trajectory; insert_keyframe() uses it to deskew the raw scan.
     odom_frame->imu_rate_trajectory.resize(8, imu_stamps.size());
     for (int i = 0; i < imu_stamps.size(); i++) {
       const gtsam::Pose3 imu_pose = values.at<gtsam::Pose3>(X(i));
@@ -162,6 +211,7 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
   }
 
 #ifdef GTSAM_POINTS_USE_CUDA
+  // Upload scan to GPU if VGICP_GPU factors will run on this frame.
   if (params.enable_gpu && !odom_frame->frame->points_gpu) {
     if (params.enable_gpu) {
       auto stream = std::static_pointer_cast<gtsam_points::CUDAStream>(this->stream);
@@ -171,23 +221,61 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
   }
 #endif
 
+  // --- Submap factor graph (member values_/graph_) ---
+  // One node per odometry frame: X(i) = T_world_sensor (sensor pose in the odometry world frame).
+  // Built incrementally until create_submap().
   const int current = odom_frames.size();
   const int last = current - 1;
   odom_frames.push_back(odom_frame);
+
+  // Seed X(current) with the odometry module's latest sensor pose.
+  //
+  // T_world_sensor() dispatches on EstimationFrame::frame_id (estimation_frame.cpp):
+  //   FrameID::IMU   -> T_world_imu   (odometry_estimation_imu / _cpu)
+  //   FrameID::LIDAR -> T_world_lidar (odometry_estimation_ct)
+  // Each backend is responsible for keeping that pose and frame_id consistent before marginalization.
+  // CT sets T_world_lidar explicitly via set_T_world_sensor() after its local scan-matching step;
+  // IMU backends update T_world_imu from the fixed-lag smoother. Submapping does not re-derive them.
+  //
+  // This insert only provides the **initial value** (linearization point) for LM in create_submap().
+  // Odometry poses are not fixed here — between/GICP/VGICP/Imu factors will move X(i) unless
+  // enable_optimization is false. After optimization, create_submap() writes values back with
+  // set_T_world_sensor(odom_frames[i]->frame_id, X(i)), preserving the same sensor convention.
+  //
+  // The "world" here refers to the **local odometry frame** for this submap,
+  // which is a drifting, map-relative frame established at the start of the
+  // current submap window.  Each odometry frame (EstimationFrame) is
+  // represented as an IMU pose (if enable_imu) or LiDAR pose (otherwise)
+  // relative to this local submap odometry frame ("world").  These local submap
+  // frames are later aligned to the global map frame during global mapping
+  // using T_world_origin; submapping itself only operates in this local
+  // context, submapping does not know the global map
+  // frame.
+  //
+  // Backend choice matters:
+  //   - IMU odometry: X(i) is IMU pose; point clouds in EstimationFrame::frame are in the IMU frame.
+  //     Required when enable_imu (ImuFactor, deskewing) — see warning below.
+  //   - CT odometry: X(i) is LiDAR pose at scan start; clouds are LiDAR-frame. IMU factors are
+  //     incompatible unless frame_id is IMU. Relative between-factor deltas remain valid because
+  //     both endpoints use the same frame_id.
   values->insert(X(current), gtsam::Pose3(odom_frame->T_world_sensor().matrix()));
 
+  // ImuFactor, IMU preintegration, and IMU-rate deskewing assume X(i) and frame::points share the IMU frame.
   if (params.enable_imu && odom_frame->frame_id != FrameID::IMU) {
     logger->warn("odom frames are not estimated in the IMU frame while sub_mapping requires IMU estimation");
   }
 
-  // Fix the first frame
+  // Fix gauge on the first pose of each submap window (odometry world origin for this batch).
   if (current == 0) {
     logger->debug("first frame in submap");
     graph->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(0), values->at<gtsam::Pose3>(X(0)), gtsam::noiseModel::Isotropic::Precision(6, 1e8));
   }
-  // Create a relative pose factor between consecutive frames
+  // Sequential odometry edge X(last)->X(current). Skipped when create_between_factors is false
+  // (graph then relies on VGICP keyframe constraints and/or ImuFactors only).
   else if (params.create_between_factors) {
     logger->debug("create between factors");
+    // Relative pose from odometry T_world_sensor estimates (same frame_id at both ends).
+    // Used as the BetweenFactor measurement; GICP optionally tightens the information matrix.
     const Eigen::Isometry3d delta = odom_frames[last]->T_world_sensor().inverse() * odom_frame->T_world_sensor();
 
     if (params.between_registration_type == "GICP") {
@@ -199,10 +287,13 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
         logger->warn("use an identity covariance because either of last or current frames have too few points (last={} current={})", last_frame->size(), current_frame->size());
         noise_model = gtsam::noiseModel::Isotropic::Precision(6, 1e3);
       } else {
+        // Linearize GICP at the odometry guess; use the resulting information matrix as edge noise.
+        // (Tighter registration → larger information → stronger constraint in the graph.)
         auto factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(X(last), X(current), last_frame, current_frame);
         auto linearized = factor->linearize(*values);
         // graph->emplace_shared<gtsam::LinearContainerFactor>(linearized, *values);
 
+        // Calculate the Hessian block diagonal for the current frame.
         gtsam::Matrix H = linearized->hessianBlockDiagonal()[X(current)];
         noise_model = gtsam::noiseModel::Gaussian::Information(H);
       }
@@ -215,7 +306,7 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     }
   }
 
-  // Create an IMU preintegration factor
+  // IMU variables: V(i) = velocity, B(i) = gyro/accel bias. ImuFactor ties pose, velocity, and bias across the interval between the last and current frames.
   if (params.enable_imu) {
     logger->debug("create IMU factor");
     const gtsam::imuBias::ConstantBias imu_bias(odom_frame->imu_bias);
@@ -223,39 +314,45 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     values->insert(V(current), odom_frame->v_world_imu);
     values->insert(B(current), imu_bias);
 
+    // Soft priors from the odometry module's current IMU state estimate.
     graph->emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(V(current), odom_frame->v_world_imu, gtsam::noiseModel::Isotropic::Precision(3, 1e3));
     graph->emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(B(current), imu_bias, gtsam::noiseModel::Isotropic::Precision(6, 1e6));
 
     if (current != 0) {
       int num_integrated = 0;
+      // Integrate the IMU data between the last and current frames.
       const int imu_read_cursor = imu_integration->integrate_imu(odom_frames[last]->stamp, odom_frames[current]->stamp, imu_bias, &num_integrated);
       imu_integration->erase_imu_data(imu_read_cursor);
 
+      // Bias factor between the last and current frames; ImuFactor encodes preintegrated IMU between X(last) and X(current).
       graph
         ->emplace_shared<gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>>(B(last), B(current), gtsam::imuBias::ConstantBias(), gtsam::noiseModel::Isotropic::Precision(6, 1e6));
       if (num_integrated >= 2) {
+        // Add an IMU factor to the factor graph: connects the poses, velocities, and biases between frames using preintegrated IMU measurements.
         graph->emplace_shared<gtsam::ImuFactor>(X(last), V(last), X(current), V(current), B(last), imu_integration->integrated_measurements());
       } else {
         logger->warn("insufficient IMU data between LiDAR frames!! (sub_mapping)");
+        // Add a simple velocity prior (zero relative velocity) when insufficient IMU data: connects velocities between frames as a weak constraint.
         graph->emplace_shared<gtsam::BetweenFactor<gtsam::Vector3>>(V(last), V(current), gtsam::Vector3::Zero(), gtsam::noiseModel::Isotropic::Precision(3, 1.0));
       }
     }
   }
 
+  // Keyframes carry voxel maps used for VGICP; not every odometry frame becomes one.
   bool insert_as_keyframe = keyframes.empty();
   if (!insert_as_keyframe && odom_frame->frame && odom_frame->frame->size() > params.keyframe_update_min_points) {
-    // Overlap-based keyframe update
     if (params.keyframe_update_strategy == "OVERLAP") {
+      // New keyframe when view overlap with the last keyframe drops (enough new geometry seen).
       if (keyframes.back()->voxelmaps.empty() || odom_frame->frame->size() < 10) {
         logger->warn("voxelmap or odom_frame is empty!! (voxelmap={} odom_frame={})", keyframes.back()->voxelmaps.size(), odom_frame->frame->size());
       } else {
+        // Calculate the overlap between the last keyframe and the current frame
         const double overlap =
           gtsam_points::overlap_auto(keyframes.back()->voxelmaps.back(), odom_frame->frame, keyframes.back()->T_world_sensor().inverse() * odom_frame->T_world_sensor());
         insert_as_keyframe = overlap < params.max_keyframe_overlap;
       }
-    }
-    // Displacement-based keyframe update
-    else if (params.keyframe_update_strategy == "DISPLACEMENT") {
+    } else if (params.keyframe_update_strategy == "DISPLACEMENT") {
+      // New keyframe after sufficient translation or rotation since the last keyframe.
       const Eigen::Isometry3d delta_from_keyframe = keyframes.back()->T_world_sensor().inverse() * odom_frame->T_world_sensor();
       const double delta_trans = delta_from_keyframe.translation().norm();
       const double delta_angle = Eigen::AngleAxisd(delta_from_keyframe.linear()).angle();
@@ -266,13 +363,13 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
     }
   }
 
-  // Create a new keyframe
   if (insert_as_keyframe) {
     logger->debug("insert frame as keyframe");
     insert_keyframe(current, odom_frame);
     Callbacks::on_new_keyframe(current, keyframes.back());
 
-    // Create registration error factors (fully connected)
+    // Scan-to-map registration factors: each prior keyframe's voxel map vs the new scan.
+    // Connects X(keyframe_indices[i]) to X(current) — loop-closure-style constraints inside the submap.
     for (int i = 0; i < keyframes.size() - 1; i++) {
       if (keyframes[i]->frame->size() == 0 || keyframes.back()->frame->size() == 0) {
         logger->warn(
@@ -282,6 +379,7 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
       }
 
       if (params.registration_error_factor_type == "VGICP") {
+        // Multi-resolution voxel maps: one VGICP factor per pyramid level.
         for (const auto& voxelmap : keyframes[i]->voxelmaps) {
           if (!voxelmap) {
             logger->warn("voxelmap is empty!");
@@ -316,11 +414,11 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
   }
 
   if (odom_frames.size() >= 2) {
-    // Drop unnecessary points data
-    // The last frame may be required to compute the relative pose factor
+    // Free point clouds on older frames; only the newest may still be needed for the next GICP between-factor.
     odom_frames[odom_frames.size() - 2] = odom_frames[odom_frames.size() - 2]->clone_wo_points();
   }
 
+  // When max_num_keyframes is reached, optimize graph + merge keyframes into a SubMap, then reset state.
   auto new_submap = create_submap();
 
   if (new_submap) {
@@ -337,9 +435,13 @@ void SubMapping::insert_frame(const EstimationFrame::ConstPtr& odom_frame_) {
 }
 
 void SubMapping::insert_keyframe(const int current, const EstimationFrame::ConstPtr& odom_frame) {
+  // Build the scan used for this keyframe. Default: odometry's already-deskewed cloud.
   gtsam_points::PointCloud::ConstPtr deskewed_frame = odom_frame->frame;
-  // Re-perform deskewing with smoothed IMU poses
+
+  // Optionally re-deskew from raw points using the IMU-rate trajectory smoothed in insert_frame().
+  // That trajectory is denser and more consistent than the odometry module's initial deskewing.
   if (params.enable_imu && odom_frame->raw_frame && odom_frame->imu_rate_trajectory.cols() >= 2) {
+    // Sanity checks: trajectory timestamps should bracket the scan interval.
     if (std::abs(odom_frame->stamp - odom_frame->imu_rate_trajectory(0, 0)) > 1e-3) {
       logger->warn("inconsistent frame stamp and imu_rate stamp!! (odom_frame={} imu_rate_trajectory={})", odom_frame->stamp, odom_frame->imu_rate_trajectory(0, 0));
     }
@@ -350,6 +452,8 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
         odom_frame->raw_frame->scan_end_time);
     }
 
+    // Unpack imu_rate_trajectory columns into timestamp + T_world_imu pose sequences.
+    // Each column: [t, tx, ty, tz, qx, qy, qz, qw].
     std::vector<double> imu_pred_times(odom_frame->imu_rate_trajectory.cols());
     std::vector<Eigen::Isometry3d> imu_pred_poses(odom_frame->imu_rate_trajectory.cols());
     for (int i = 0; i < odom_frame->imu_rate_trajectory.cols(); i++) {
@@ -360,14 +464,18 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
       imu_pred_poses[i].linear() = Eigen::Quaterniond(imu[7], imu[4], imu[5], imu[6]).toRotationMatrix();
     }
 
+    // Motion-compensate each raw point to the scan start time using the per-sample IMU poses.
+    // deskew() expects T_imu_lidar and returns points in the IMU frame at scan start.
     auto deskewed =
       deskewing
         ->deskew(odom_frame->T_lidar_imu.inverse(), imu_pred_times, imu_pred_poses, odom_frame->raw_frame->stamp, odom_frame->raw_frame->times, odom_frame->raw_frame->points);
 
+    // Wrap in PointCloudCPU and express points in the LiDAR frame (EstimationFrame::frame convention).
     auto frame = std::make_shared<gtsam_points::PointCloudCPU>(deskewed);
     for (int i = 0; i < frame->size(); i++) {
       frame->points[i] = odom_frame->T_lidar_imu.inverse() * frame->points[i];
     }
+    // Per-point covariances for GICP/VGICP; neighbor indices come from the raw preprocess step.
     frame->add_covs(covariance_estimation->estimate(frame->points_storage, odom_frame->raw_frame->neighbors));
     if (!odom_frame->raw_frame->intensities.empty()) {
       frame->add_intensities(odom_frame->raw_frame->intensities);
@@ -375,9 +483,10 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
     deskewed_frame = frame;
   }
 
-  // Random sampling for registration error factors
+  // Subsample for registration factors — full clouds are too heavy for pairwise VGICP in the submap graph.
   gtsam_points::PointCloud::Ptr subsampled_frame = gtsam_points::random_sampling(deskewed_frame, params.keyframe_randomsampling_rate, mt);
 
+  // Copy odometry metadata (pose, stamp, IMU state, …); point cloud and voxelmaps are replaced below.
   EstimationFrame::Ptr keyframe(new EstimationFrame);
   *keyframe = *odom_frame;
 
@@ -387,6 +496,7 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
     keyframe->frame = gtsam_points::PointCloudGPU::clone(*subsampled_frame, *stream);
     keyframe->voxelmaps.clear();
 
+    // Multi-resolution Gaussian voxel maps of this scan — targets for VGICP_GPU factors vs later keyframes.
     for (int i = 0; i < params.keyframe_voxelmap_levels; i++) {
       const double resolution = params.keyframe_voxel_resolution * std::pow(params.keyframe_voxelmap_scaling_factor, i);
       auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapGPU>(resolution, 8192 * 2, 10, 1e-3, *stream);
@@ -398,6 +508,7 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
 #endif
   } else {
     keyframe->voxelmaps.clear();
+    // Same multi-resolution voxel pyramid on CPU for IntegratedVGICPFactor.
     for (int i = 0; i < params.keyframe_voxelmap_levels; i++) {
       const double resolution = params.keyframe_voxel_resolution * std::pow(params.keyframe_voxelmap_scaling_factor, i);
       auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(resolution);
@@ -408,6 +519,7 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
     keyframe->frame = subsampled_frame;
   }
 
+  // Register keyframe: keyframe_indices maps keyframe slot -> odom_frames graph index X(i).
   keyframes.push_back(keyframe);
   keyframe_indices.push_back(current);
 }
@@ -490,6 +602,15 @@ SubMap::Ptr SubMapping::create_submap(bool force_create) const {
     submap->frame = gtsam_points::merge_frames_auto(poses_to_merge, keyframes_to_merge, params.submap_downsample_resolution);
   }
   logger->debug("|merged_submap|={}", submap->frame->size());
+
+  if (dynamic_removal) {
+    const size_t before_size = submap->frame->size();
+    auto filtered = dynamic_removal->filter(submap->frame, keyframes_to_merge, poses_to_merge);
+    if (filtered) {
+      submap->frame = filtered;
+      logger->debug("dynamic removal: {} -> {} points", before_size, submap->frame->size());
+    }
+  }
 
   if (params.submap_target_num_points > 0 && submap->frame->size() > params.submap_target_num_points) {
     std::mt19937 mt(submap_count * 643145 + submap->frame->size() * 4312);  // Just a random-like seed

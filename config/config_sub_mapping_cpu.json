@@ -24,6 +24,12 @@
     "keyframe_voxelmap_scaling_factor": 2.0,
     // Post processing
     "submap_downsample_resolution": 0.3,
-    "submap_voxel_resolution": 0.5
+    "submap_voxel_resolution": 0.5,
+    // Dynamic object removal
+    "dynamic_removal_method": "NONE",
+    "dynamic_removal_voxel_resolution": 0.3,
+    "dynamic_removal_min_hit_ratio": 0.4,
+    "dynamic_removal_min_total_frames": 3,
+    "dynamic_removal_count_mode": "OBSERVED"
   }
 }

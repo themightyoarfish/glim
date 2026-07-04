@@ -28,6 +28,12 @@
     "submap_voxel_resolution": 0.5,
     "min_dist_in_voxel": 0.2,
     "max_num_points_in_voxel": 100,
-    "submap_target_num_points": 50000
+    "submap_target_num_points": 50000,
+    // Dynamic object removal (SubMapping module only)
+    "dynamic_removal_method": "NONE",
+    "dynamic_removal_voxel_resolution": 0.3,
+    "dynamic_removal_min_hit_ratio": 0.4,
+    "dynamic_removal_min_total_frames": 3,
+    "dynamic_removal_count_mode": "OBSERVED"
   }
 }

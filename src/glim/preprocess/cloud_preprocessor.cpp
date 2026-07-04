@@ -171,6 +171,7 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
   // Create a preprocessed frame
   PreprocessedFrame::Ptr preprocessed(new PreprocessedFrame);
   preprocessed->stamp = raw_points->stamp;
+  // The scan end time is the scan time plus the time delta of the last point in the scan, because the times are sorted earlier
   preprocessed->scan_end_time = frame->size() ? raw_points->stamp + frame->times[frame->size() - 1] : raw_points->stamp;
 
   preprocessed->times.assign(frame->times, frame->times + frame->size());
